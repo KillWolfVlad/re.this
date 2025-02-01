@@ -8,18 +8,20 @@ import io.ktor.utils.io.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.io.Buffer
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.io.readString
+import kotlin.time.Duration.Companion.milliseconds
 
 internal class RedisConnection(
     rootJob: Job,
     connectionName: String,
-    private val overdriveMode: Boolean,
     private val redisConnectionString: String,
 ) {
     private data class RequestPayload(
         val command: String,
         val arguments: List<String>,
+        val request: String,
         val responseChannel: Channel<String>,
     )
 
@@ -34,11 +36,14 @@ internal class RedisConnection(
     private lateinit var readChannel: ByteReadChannel
     private lateinit var writeChannel: ByteWriteChannel
 
-    private val requestSharedFlow = MutableSharedFlow<RequestPayload>()
-    private val responseSharedFlow = MutableSharedFlow<RequestPayload>()
+    private val responsesSharedFlow = MutableSharedFlow<RequestPayload>()
+    private lateinit var readResponsesJob: Job
 
-    private lateinit var requestCollectJob: Job
-    private lateinit var responseCollectJob: Job
+    private lateinit var flushDelayJob: Job
+    private lateinit var flushSizeJob: Job
+
+    private val requestsMutex = Mutex()
+    private val requestsQueue = Channel<RequestPayload>(Channel.UNLIMITED)
 
     suspend fun init() {
         val url = Url(redisConnectionString)
@@ -50,23 +55,50 @@ internal class RedisConnection(
         readChannel = socket.openReadChannel()
         writeChannel = socket.openWriteChannel()
 
-        requestCollectJob = coroutineScope.launch {
-            requestSharedFlow.collect { requestPayload ->
-                writeRequest(requestPayload)
+        readResponsesJob = coroutineScope.launch {
+            responsesSharedFlow.collect { requestPayload ->
+                readResponse(requestPayload)
             }
         }
 
-        responseCollectJob = coroutineScope.launch {
-            responseSharedFlow.collect { requestPayload ->
-                readResponse(requestPayload)
+        val requests = mutableListOf<RequestPayload>()
+
+        flushDelayJob = coroutineScope.launch {
+            while (true) {
+                delay(10.milliseconds)
+
+                requestsMutex.withLock {
+                    if (requests.isNotEmpty()) {
+                        flush(requests)
+
+                        requests.clear()
+                    }
+                }
+            }
+        }
+
+        flushSizeJob = coroutineScope.launch {
+            while (true) {
+                val request = requestsQueue.receive()
+
+                requestsMutex.withLock {
+                    requests.add(request)
+
+                    if (requests.size >= 10) {
+                        flush(requests)
+
+                        requests.clear()
+                    }
+                }
             }
         }
     }
 
     fun close() {
         runCatching {
-            requestCollectJob.cancel()
-            responseCollectJob.cancel()
+            flushDelayJob.cancel()
+            flushSizeJob.cancel()
+            readResponsesJob.cancel()
 
             socket.close()
             selectorManager.close()
@@ -76,33 +108,28 @@ internal class RedisConnection(
     suspend fun execute(command: String, vararg arguments: String): String {
         val responseChannel = Channel<String>(1)
 
-        requestSharedFlow.emit(RequestPayload(command, arguments.toList(), responseChannel))
-        logger.trace("EMIT: $command ${arguments.joinToString(" ")}")
+        addRequestToQueue(responseChannel, command, *arguments)
 
         val response = responseChannel.receive()
 
         return response
     }
 
-    private suspend fun writeRequest(requestPayload: RequestPayload) {
-        val rawCommand =
-            "*${1 + requestPayload.arguments.size}\r\n${
-                listOf(
-                    requestPayload.command,
-                    *requestPayload.arguments.toTypedArray(),
-                ).joinToString("\r\n") { "$${it.length}\r\n$it" }
+    private suspend fun addRequestToQueue(
+        responseChannel: Channel<String>,
+        command: String,
+        vararg arguments: String,
+    ) {
+        val request =
+            "*${1 + arguments.size}\r\n${
+                listOf(command, *arguments).joinToString("\r\n") { "$${it.length}\r\n$it" }
             }\r\n"
 
-        writeChannel.writeStringUtf8(rawCommand)
-        writeChannel.flush()
+        val requestPayload = RequestPayload(command, arguments.toList(), request, responseChannel)
 
-        if (overdriveMode) {
-            responseSharedFlow.emit(requestPayload)
-            logger.trace("WRITE: ${requestPayload.command} ${requestPayload.arguments.joinToString(" ")}")
-        } else {
-            logger.trace("WRITE: ${requestPayload.command} ${requestPayload.arguments.joinToString(" ")}")
-            readResponse(requestPayload)
-        }
+        requestsQueue.send(requestPayload)
+
+        logger.trace("ADD TO QUEUE: $command ${arguments.joinToString(" ")}")
     }
 
     private suspend fun readResponse(requestPayload: RequestPayload) {
@@ -122,13 +149,22 @@ internal class RedisConnection(
         requestPayload.responseChannel.send(response)
         logger.trace("READ: ${requestPayload.command} ${requestPayload.arguments.joinToString(" ")} = $response")
     }
+
+    private suspend fun flush(requests: List<RequestPayload>) {
+        writeChannel.writeStringUtf8(requests.joinToString("") { it.request })
+        writeChannel.flush()
+
+        logger.trace("FLUSH: requests size = ${requests.size}")
+
+        requests.forEach { responsesSharedFlow.emit(it) }
+    }
 }
 
 val CARRIAGE_RETURN_BYTE = '\r'.code.toByte()
 val NEWLINE_BYTE = '\n'.code.toByte()
 
-private suspend inline fun ByteReadChannel.readLineCRLF(): Buffer {
-    val buffer = Buffer()
+private suspend inline fun ByteReadChannel.readLineCRLF(): kotlinx.io.Buffer {
+    val buffer = kotlinx.io.Buffer()
     while (true) {
         val byte = readByte()
 

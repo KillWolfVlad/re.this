@@ -23,9 +23,7 @@ class KillWolfVladRedisBenchmark {
     )
 
     private lateinit var redisClient: RedisClient
-    private lateinit var redisClientOverdrive: RedisClient
     private lateinit var redisClientPool: RedisClient
-    private lateinit var redisClientPoolOverdrive: RedisClient
 
     @Setup
     fun setup() {
@@ -33,25 +31,19 @@ class KillWolfVladRedisBenchmark {
 
         val redisConnectionString = "redis://${redis.host}:${redis.firstMappedPort}"
 
-        redisClient = RedisClient(redisConnectionString, overdriveMode = false, poolMode = false)
-        redisClientOverdrive = RedisClient(redisConnectionString, overdriveMode = true, poolMode = false)
-        redisClientPool = RedisClient(redisConnectionString, overdriveMode = false, poolMode = true)
-        redisClientPoolOverdrive = RedisClient(redisConnectionString, overdriveMode = true, poolMode = true)
+        redisClient = RedisClient(redisConnectionString, poolMode = false)
+        redisClientPool = RedisClient(redisConnectionString, poolMode = true)
 
         GlobalScope.launch {
             redisClient.init()
-            redisClientOverdrive.init()
             redisClientPool.init()
-            redisClientPoolOverdrive.init()
         }
     }
 
     @TearDown
     fun tearDown() {
         redisClient.close()
-        redisClientOverdrive.close()
         redisClientPool.close()
-        redisClientPoolOverdrive.close()
 
         redis.stop()
     }
@@ -69,36 +61,12 @@ class KillWolfVladRedisBenchmark {
     }
 
     @Benchmark
-    fun killWolfVladRedisOverdriveSetGet(bh: Blackhole) {
-        val randInt = (1..10_000).random()
-
-        GlobalScope.launch {
-            bh.consume(redisClientOverdrive.execute("SET", "keyKwRedisOver$randInt", "value$randInt"))
-            val value = redisClientOverdrive.execute("GET", "keyKwRedisOver$randInt")
-
-            assert(value == "value$randInt")
-        }
-    }
-
-    @Benchmark
     fun killWolfVladRedisPoolSetGet(bh: Blackhole) {
         val randInt = (1..10_000).random()
 
         GlobalScope.launch {
             bh.consume(redisClientPool.execute("SET", "keyKwRedisPool$randInt", "value$randInt"))
             val value = redisClientPool.execute("GET", "keyKwRedisPool$randInt")
-
-            assert(value == "value$randInt")
-        }
-    }
-
-    @Benchmark
-    fun killWolfVladRedisPoolOverdriveSetGet(bh: Blackhole) {
-        val randInt = (1..10_000).random()
-
-        GlobalScope.launch {
-            bh.consume(redisClientPoolOverdrive.execute("SET", "keyKwRedisPoolOver$randInt", "value$randInt"))
-            val value = redisClientPoolOverdrive.execute("GET", "keyKwRedisPoolOver$randInt")
 
             assert(value == "value$randInt")
         }

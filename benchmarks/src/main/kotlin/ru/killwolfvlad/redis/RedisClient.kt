@@ -5,7 +5,6 @@ import ru.killwolfvlad.redis.internal.RedisConnection
 
 class RedisClient(
     redisConnectionString: String,
-    overdriveMode: Boolean,
     private val poolMode: Boolean,
 ) {
     /**
@@ -28,13 +27,13 @@ class RedisClient(
     private val rootJob = SupervisorJob()
 
     private var connection: RedisConnection =
-        RedisConnection(rootJob, "SingleConnection", overdriveMode, redisConnectionString)
+        RedisConnection(rootJob, "SingleConnection", redisConnectionString)
 
     private val connectionsPool = List(50) {
-        RedisConnection(rootJob, "PoolConnection${it}", overdriveMode, redisConnectionString)
+        RedisConnection(rootJob, "PoolConnection${it}", redisConnectionString)
     }
 
-    private val connectionsPoolRoundRobit = RoundRobinIterable(connectionsPool)
+    private val connectionsPoolRoundRobin = RoundRobinIterable(connectionsPool)
 
     suspend fun init() {
         if (poolMode) {
@@ -54,7 +53,7 @@ class RedisClient(
 
     suspend fun execute(command: String, vararg arguments: String): String {
         return if (poolMode) {
-            connectionsPoolRoundRobit.getNext().execute(command, *arguments)
+            connectionsPoolRoundRobin.getNext().execute(command, *arguments)
         } else {
             connection.execute(command, *arguments)
         }
